@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright (c) 2005, 2017 IBM Corporation and others.
+ * Copyright (c) 2005, 2026 IBM Corporation and others.
  *
  * This program and the accompanying materials
  * are made available under the terms of the Eclipse Public License 2.0
@@ -20,10 +20,15 @@ import static org.eclipse.swt.events.SelectionListener.widgetSelectedAdapter;
 
 import java.lang.reflect.InvocationTargetException;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.function.BiFunction;
 
 import org.eclipse.core.runtime.CoreException;
@@ -35,8 +40,11 @@ import org.eclipse.jface.dialogs.IDialogSettings;
 import org.eclipse.jface.operation.IRunnableContext;
 import org.eclipse.jface.viewers.ArrayContentProvider;
 import org.eclipse.jface.viewers.CheckboxTableViewer;
+import org.eclipse.jface.viewers.ICheckStateProvider;
 import org.eclipse.jface.viewers.IStructuredSelection;
 import org.eclipse.jface.viewers.StructuredSelection;
+import org.eclipse.jface.viewers.Viewer;
+import org.eclipse.jface.viewers.ViewerFilter;
 import org.eclipse.pde.core.plugin.IPluginModelBase;
 import org.eclipse.pde.core.plugin.PluginRegistry;
 import org.eclipse.pde.internal.core.PDECore;
@@ -58,6 +66,7 @@ import org.eclipse.swt.layout.GridLayout;
 import org.eclipse.swt.widgets.Button;
 import org.eclipse.swt.widgets.Composite;
 import org.eclipse.swt.widgets.Control;
+import org.eclipse.swt.widgets.Text;
 import org.eclipse.ui.forms.widgets.FormToolkit;
 import org.eclipse.ui.forms.widgets.ScrolledPageBook;
 
@@ -109,9 +118,56 @@ public class TracingBlock {
 		}
 	}
 
+	/**
+	 * Shows only the plug-ins whose ID or whose tracing options contain the
+	 * filter text (case-insensitive).
+	 */
+	private class TracingFilter extends ViewerFilter {
+
+		private String fPattern = ""; //$NON-NLS-1$
+		private Set<String> fMatchingPluginIds;
+
+		void setPattern(String pattern) {
+			fPattern = pattern.trim().toLowerCase(Locale.ROOT);
+			fMatchingPluginIds = null;
+		}
+
+		boolean isActive() {
+			return !fPattern.isEmpty();
+		}
+
+		@Override
+		public boolean select(Viewer viewer, Object parentElement, Object element) {
+			if (!isActive() || !(element instanceof IPluginModelBase model)) {
+				return true;
+			}
+			String id = model.getPluginBase().getId();
+			return id != null && (id.toLowerCase(Locale.ROOT).contains(fPattern) || getMatchingPluginIds().contains(id));
+		}
+
+		private Set<String> getMatchingPluginIds() {
+			if (fMatchingPluginIds == null) {
+				fMatchingPluginIds = new HashSet<>();
+				for (String key : fMasterOptions.keySet()) {
+					int separator = key.indexOf('/');
+					// comment keys start with '#'
+					if (separator > 0 && !key.startsWith("#") //$NON-NLS-1$
+							&& key.substring(separator + 1).toLowerCase(Locale.ROOT).contains(fPattern)) {
+						fMatchingPluginIds.add(key.substring(0, separator));
+					}
+				}
+			}
+			return fMatchingPluginIds;
+		}
+	}
+
 	private TracingOptionsManagerDelegate fTracingOptionsManagerDelegate;
 	private final TracingTab fTab;
 	private Button fTracingCheck;
+	private Text fFilterText;
+	private final TracingFilter fFilter = new TracingFilter();
+	/** Checked plug-ins, including those currently hidden by the filter. */
+	private final Set<IPluginModelBase> fCheckedModels = new HashSet<>();
 	private CheckboxTableViewer fPluginViewer;
 	private IPluginModelBase[] fTraceableModels;
 	private final Map<String, String> fMasterOptions = new HashMap<>();
@@ -171,28 +227,48 @@ public class TracingBlock {
 		layout.marginWidth = layout.marginHeight = 1;
 		composite.setLayout(layout);
 
+		fFilterText = new Text(composite, SWT.SEARCH | SWT.ICON_SEARCH | SWT.ICON_CANCEL);
+		fFilterText.setMessage(PDEUIMessages.TracingBlock_filter_message);
+		fFilterText.setLayoutData(new GridData(GridData.FILL_HORIZONTAL));
+		fFilterText.addModifyListener(e -> {
+			fFilter.setPattern(fFilterText.getText());
+			fPluginViewer.refresh();
+		});
+
 		fPluginViewer = CheckboxTableViewer.newCheckList(composite, SWT.BORDER);
 		fPluginViewer.setContentProvider(ArrayContentProvider.getInstance());
 		fPluginViewer.setLabelProvider(PDEPlugin.getDefault().getLabelProvider());
 		fPluginViewer.setComparator(new ListUtil.PluginComparator());
+		fPluginViewer.addFilter(fFilter);
+		fPluginViewer.setCheckStateProvider(new ICheckStateProvider() {
+			@Override
+			public boolean isChecked(Object element) {
+				return fCheckedModels.contains(element);
+			}
+
+			@Override
+			public boolean isGrayed(Object element) {
+				return false;
+			}
+		});
 		fPluginViewer.addSelectionChangedListener(e -> {
-			fRestoreSelectedDefaultButton.setEnabled(true);
-			CheckboxTableViewer tableViewer = (CheckboxTableViewer) e.getSource();
-			boolean selected = tableViewer.getChecked(getSelectedModel());
-			pluginSelected(getSelectedModel(), selected);
-			storeSelectedModel();
+			IPluginModelBase model = getSelectedModel();
+			fRestoreSelectedDefaultButton.setEnabled(model != null);
+			pluginSelected(model, fCheckedModels.contains(model));
+			if (model != null) {
+				storeSelectedModel();
+			}
 		});
 		fPluginViewer.addCheckStateListener(event -> {
-			CheckboxTableViewer tableViewer = (CheckboxTableViewer) event.getSource();
-			tableViewer.setSelection(new StructuredSelection(event.getElement()));
+			setChecked(List.of(event.getElement()), event.getChecked());
+			fPluginViewer.setSelection(new StructuredSelection(event.getElement()));
 			pluginSelected(getSelectedModel(), event.getChecked());
 			fTab.updateLaunchConfigurationDialog();
 		});
 		fPluginViewer.addDoubleClickListener(event -> {
-			CheckboxTableViewer tableViewer = (CheckboxTableViewer) event.getSource();
 			Object selection = ((IStructuredSelection) event.getSelection()).getFirstElement();
-			boolean addingCheck = !tableViewer.getChecked(selection);
-			tableViewer.setChecked(selection, addingCheck);
+			boolean addingCheck = !fCheckedModels.contains(selection);
+			setChecked(List.of(selection), addingCheck);
 			pluginSelected(getSelectedModel(), addingCheck);
 			fTab.updateLaunchConfigurationDialog();
 		});
@@ -223,7 +299,7 @@ public class TracingBlock {
 		fSelectAllButton.setLayoutData(new GridData(GridData.HORIZONTAL_ALIGN_BEGINNING));
 		SWTUtil.setButtonDimensionHint(fSelectAllButton);
 		fSelectAllButton.addSelectionListener(widgetSelectedAdapter(e -> {
-			fPluginViewer.setAllChecked(true);
+			setChecked(getVisibleModels(), true);
 			pluginSelected(getSelectedModel(), true);
 			fTab.updateLaunchConfigurationDialog();
 		}));
@@ -233,7 +309,7 @@ public class TracingBlock {
 		fDeselectAllButton.setLayoutData(new GridData(GridData.HORIZONTAL_ALIGN_BEGINNING));
 		SWTUtil.setButtonDimensionHint(fDeselectAllButton);
 		fDeselectAllButton.addSelectionListener(widgetSelectedAdapter(e -> {
-			fPluginViewer.setAllChecked(false);
+			setChecked(getVisibleModels(), false);
 			pluginSelected(getSelectedModel(), false);
 			fTab.updateLaunchConfigurationDialog();
 		}));
@@ -262,7 +338,7 @@ public class TracingBlock {
 							source.setChanged(true);
 						}
 					});
-					pluginSelected(model, fPluginViewer.getChecked(model));
+					pluginSelected(model, fCheckedModels.contains(model));
 				}
 			}
 		}));
@@ -275,20 +351,16 @@ public class TracingBlock {
 			disposePropertySources();
 			fMasterOptions.clear();
 			fMasterOptions.putAll(fTracingOptionsManagerDelegate.getTracingTemplateCopy());
-			Object[] elements = fPluginViewer.getCheckedElements();
-			for (Object element : elements) {
-				if (element instanceof IPluginModelBase model) {
-					TracingPropertySource source = getPropertySource(model);
-					PageBookKey key = new PageBookKey(model, true);
-					Composite parentPage = fPageBook.createPage(key);
-					source.createContents(parentPage, true);
-					source.setChanged(false);
-				}
+			for (IPluginModelBase model : fCheckedModels) {
+				TracingPropertySource source = getPropertySource(model);
+				PageBookKey key = new PageBookKey(model, true);
+				Composite parentPage = fPageBook.createPage(key);
+				source.createContents(parentPage, true);
+				source.setChanged(false);
 			}
 			IStructuredSelection selec = fPluginViewer.getStructuredSelection();
-			if (selec.getFirstElement() instanceof IPluginModelBase) {
-				IPluginModelBase model = (IPluginModelBase) fPluginViewer.getStructuredSelection().getFirstElement();
-				pluginSelected(model, fPluginViewer.getChecked(model));
+			if (selec.getFirstElement() instanceof IPluginModelBase model) {
+				pluginSelected(model, fCheckedModels.contains(model));
 			}
 		}));
 	}
@@ -327,18 +399,20 @@ public class TracingBlock {
 			fMasterOptions.putAll(options == null //
 					? fTracingOptionsManagerDelegate.getTracingTemplateCopy() //
 					: fTracingOptionsManagerDelegate.getTracingOptions(options));
+			fFilter.setPattern(fFilterText.getText());
 
+			fCheckedModels.clear();
 			masterCheckChanged();
 			String checked = config.getAttribute(IPDELauncherConstants.TRACING_CHECKED, (String) null);
 			if (checked == null) {
-				fPluginViewer.setAllChecked(true);
+				setChecked(Arrays.asList(getTraceableModels()), true);
 			} else if (checked.equals(IPDELauncherConstants.TRACING_NONE)) {
-				fPluginViewer.setAllChecked(false);
+				fPluginViewer.refresh();
 			} else {
 				List<IPluginModelBase> list = LaunchArgumentsHelper.splitElementsByComma(checked) //
 						.map(PluginRegistry::findModel).filter(Objects::nonNull).toList();
 
-				fPluginViewer.setCheckedElements(list.toArray());
+				setChecked(list, true);
 				IPluginModelBase model = getLastSelectedPlugin();
 				if (model == null && !list.isEmpty()) {
 					model = list.get(0);
@@ -390,16 +464,18 @@ public class TracingBlock {
 			}
 		}
 
-		Object[] checked = fPluginViewer.getCheckedElements();
+		// keep the order of the viewer so that the attribute is stable
+		IPluginModelBase[] checked = Arrays.stream(getTraceableModels()).filter(fCheckedModels::contains)
+				.sorted((m1, m2) -> fPluginViewer.getComparator().compare(fPluginViewer, m1, m2))
+				.toArray(IPluginModelBase[]::new);
 		if (checked.length == 0) {
 			config.setAttribute(IPDELauncherConstants.TRACING_CHECKED, IPDELauncherConstants.TRACING_NONE);
-		} else if (checked.length == fPluginViewer.getTable().getItemCount()) {
+		} else if (checked.length == getTraceableModels().length) {
 			config.setAttribute(IPDELauncherConstants.TRACING_CHECKED, (String) null);
 		} else {
 			StringBuilder buffer = new StringBuilder();
 			for (int i = 0; i < checked.length; i++) {
-				IPluginModelBase model = (IPluginModelBase) checked[i];
-				buffer.append(model.getPluginBase().getId());
+				buffer.append(checked[i].getPluginBase().getId());
 				if (i < checked.length - 1) {
 					buffer.append(',');
 				}
@@ -492,7 +568,7 @@ public class TracingBlock {
 			settings = PDEPlugin.getDefault().getDialogSettings().addNewSection(TRACING_SETTINGS);
 		}
 		IPluginModelBase model = getSelectedModel();
-		if (model != null && fPluginViewer.getChecked(model)) {
+		if (model != null && fCheckedModels.contains(model)) {
 			settings.put(SETTINGS_SELECTED_PLUGIN, model.getPluginBase().getId());
 		} else {
 			settings.put(SETTINGS_SELECTED_PLUGIN, (String) null);
@@ -510,6 +586,24 @@ public class TracingBlock {
 			source.setChanged(true);
 			return source;
 		});
+	}
+
+	private void setChecked(Collection<?> elements, boolean checked) {
+		for (Object element : elements) {
+			if (element instanceof IPluginModelBase model) {
+				if (checked) {
+					fCheckedModels.add(model);
+				} else {
+					fCheckedModels.remove(model);
+				}
+			}
+		}
+		fPluginViewer.refresh();
+	}
+
+	private List<IPluginModelBase> getVisibleModels() {
+		return Arrays.stream(fPluginViewer.getTable().getItems()).map(item -> item.getData())
+				.filter(IPluginModelBase.class::isInstance).map(IPluginModelBase.class::cast).toList();
 	}
 
 	private void masterCheckChanged() {
